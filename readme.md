@@ -79,6 +79,10 @@ The filters can be toggled at runtime using the keybindings:
 - `ctrl-f`: toggle folder
 - `ctrl-e`: toggle exit code success
 
+`shift-delete` removes the selected command from history. This deletes every
+occurrence of the exact same command from all `*.bosh` files under `~/.osh` by
+rewriting them. There is no confirmation and no undo.
+
 ### Search Syntax
 
 We borrow `fzf`'s syntax for matching items:

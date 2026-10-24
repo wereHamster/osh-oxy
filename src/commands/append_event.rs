@@ -1,6 +1,6 @@
 use anyhow::Context;
 
-use crate::{event::Event, formats::rmp::BinaryWriter};
+use crate::{event::Event, formats::rmp::BinaryWriter, lock_osh_dir};
 
 /// # Errors
 ///
@@ -22,6 +22,9 @@ pub fn invoke(
     osh_file.push(".osh/");
     std::fs::create_dir_all(&osh_file)?;
     osh_file.push("local.bosh");
+
+    // the file may be replaced by a rewrite (see `remove_command`) between open and write
+    let _lock = lock_osh_dir()?;
 
     let file = std::fs::OpenOptions::new()
         .create(true)

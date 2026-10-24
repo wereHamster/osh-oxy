@@ -1,7 +1,8 @@
 use std::{
     cmp::Reverse,
     collections::HashSet,
-    fs::File,
+    fs::{File, OpenOptions},
+    io::BufWriter,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
@@ -15,7 +16,10 @@ use rayon::{
 
 use crate::{
     event::Event,
-    formats::{Kind, rmp},
+    formats::{
+        Kind,
+        rmp::{self, BinaryWriter},
+    },
 };
 
 pub mod commands;
@@ -78,8 +82,73 @@ fn discover_files(root: &Path, kind: &formats::Kind) -> anyhow::Result<HashSet<P
 ///
 /// Will return an `Err` if `home_dir()` discovery fails.
 pub fn osh_files(kind: &formats::Kind) -> anyhow::Result<HashSet<PathBuf>> {
+    discover_files(&osh_dir()?, kind)
+}
+
+fn osh_dir() -> anyhow::Result<PathBuf> {
     let home_dir = home::home_dir().ok_or(anyhow!("no home directory"))?;
-    discover_files(&home_dir.join(".osh"), kind)
+    Ok(home_dir.join(".osh"))
+}
+
+/// take an exclusive lock on `~/.osh/.lock` to serialise appends with rewrites of osh files.
+/// The lock is released when the returned file is dropped.
+///
+/// # Errors
+///
+/// Will return an `Err` if the lock file can't be created or locked.
+pub fn lock_osh_dir() -> anyhow::Result<File> {
+    let dir = osh_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// remove all events with exactly `command` from all binary osh files in `~/.osh` and return
+/// the number of removed events.
+///
+/// # Errors
+///
+/// Will return an `Err` if locking, parsing or rewriting any osh file fails.
+pub fn remove_command(command: &str) -> anyhow::Result<usize> {
+    let _lock = lock_osh_dir()?;
+    osh_files(&Kind::Rmp)?
+        .iter()
+        .map(|path| remove_command_from_file(path, command))
+        .sum()
+}
+
+/// rewrite `path` without the events matching `command`. The new content is written to a
+/// temporary file which then replaces `path`, so readers never see a partially written file.
+fn remove_command_from_file(path: &Path, command: &str) -> anyhow::Result<usize> {
+    let data = std::fs::read(path)?;
+    let events = rmp::load_osh_events(&data)?;
+    let before = events.len();
+    let kept: Vec<Event> = events
+        .into_iter()
+        .filter(|event| event.command != command)
+        .collect();
+    let removed = before - kept.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    let tmp_path = path.with_extension("bosh.tmp");
+    let tmp_file = File::create(&tmp_path)?;
+    tmp_file.set_permissions(std::fs::metadata(path)?.permissions())?;
+    let mut writer = BinaryWriter::new(BufWriter::new(&tmp_file));
+    for event in kept {
+        writer.write(event)?;
+    }
+    writer.flush()?;
+    drop(writer);
+    tmp_file.sync_all()?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(removed)
 }
 
 /// load all binary osh files in `~/.osh` and return a merged and sorted vector of all events
@@ -119,6 +188,51 @@ mod tests {
         file.write_all(data).unwrap();
         let mapped = mmap(&file);
         assert_eq!(mapped, data);
+    }
+
+    fn event(command: &str) -> Event {
+        Event {
+            timestamp_millis: 0,
+            command: command.to_string(),
+            endtime: 0,
+            exit_code: 0,
+            folder: String::new(),
+            machine: String::new(),
+            session: String::new(),
+        }
+    }
+
+    #[test]
+    fn remove_command_rewrites_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("host.bosh");
+        let mut writer = BinaryWriter::new(File::create(&path).unwrap());
+        for command in ["ls", "export TOKEN=secret", "pwd", "export TOKEN=secret"] {
+            writer.write(event(command)).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let removed = remove_command_from_file(&path, "export TOKEN=secret").unwrap();
+        assert_eq!(removed, 2);
+        let commands: Vec<String> = rmp::load_osh_events(&std::fs::read(&path).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|event| event.command)
+            .collect();
+        assert_eq!(commands, ["ls", "pwd"]);
+        assert!(!path.with_extension("bosh.tmp").exists());
+    }
+
+    #[test]
+    fn remove_command_skips_unmatched_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("host.bosh");
+        let mut writer = BinaryWriter::new(File::create(&path).unwrap());
+        writer.write(event("ls")).unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(remove_command_from_file(&path, "pwd").unwrap(), 0);
+        assert!(!path.with_extension("bosh.tmp").exists());
     }
 
     #[test]

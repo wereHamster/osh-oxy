@@ -270,6 +270,8 @@ struct App {
     show_score: bool,
     /// deduplicated list of entries (see [`EventFilter::Duplicates`])
     dedup_map: HashMap<String, usize>,
+    /// commands removed from history; the loader may still send events loaded before removal
+    removed: HashSet<String>,
 }
 
 impl App {
@@ -294,16 +296,49 @@ impl App {
             session_id,
             show_score,
             dedup_map: HashMap::new(),
+            removed: HashSet::new(),
         }
     }
 
     fn collect_new_events(&mut self) {
         let mut new_events = self.reader.take();
+        new_events.retain(|e| !self.removed.contains(&e.command));
         let base = self.events.len();
         for (i, e) in new_events.iter().enumerate() {
             self.dedup_map.entry(e.command.clone()).or_insert(base + i);
         }
         self.events.append(&mut new_events);
+    }
+
+    fn selected_event(&self) -> Option<&Event> {
+        self.indexer
+            .as_ref()
+            .and_then(|indexer| indexer.get(self.selected_index))
+            .and_then(|index| self.events.get(index))
+    }
+
+    /// remove all events of the selected command from the history files and the app state
+    fn remove_selected(&mut self, visible_rows: usize) -> anyhow::Result<()> {
+        let Some(command) = self.selected_event().map(|e| e.command.clone()) else {
+            return Ok(());
+        };
+        crate::remove_command(&command)?;
+        self.forget_command(command, visible_rows);
+        Ok(())
+    }
+
+    /// drop all events of `command` while keeping the selection on the same row
+    fn forget_command(&mut self, command: String, visible_rows: usize) {
+        self.events.retain(|e| e.command != command);
+        self.dedup_map.clear();
+        for (i, e) in self.events.iter().enumerate() {
+            self.dedup_map.entry(e.command.clone()).or_insert(i);
+        }
+        self.removed.insert(command);
+        let selected_index = self.selected_index;
+        self.run_matcher();
+        self.selected_index = selected_index;
+        self.clamp_selection(visible_rows);
     }
 
     fn run_matcher(&mut self) {
@@ -470,13 +505,12 @@ impl App {
                     TerminaEvent::Key(key) if key.kind == KeyEventKind::Press => {
                         match (key.code, key.modifiers) {
                             (KeyCode::Enter, _) => {
-                                let selected = self
-                                    .indexer
-                                    .as_ref()
-                                    .and_then(|indexer| indexer.get(self.selected_index))
-                                    .and_then(|index| self.events.get(index))
-                                    .cloned();
-                                return Ok(selected);
+                                return Ok(self.selected_event().cloned());
+                            }
+                            (KeyCode::Delete, KeyModifiers::SHIFT) => {
+                                self.remove_selected(visible_history_rows(terminal_area(
+                                    terminal,
+                                )?))?;
                             }
                             (
                                 KeyCode::Char(to_insert),
@@ -698,6 +732,7 @@ mod tests {
             session_id: None,
             show_score: false,
             dedup_map: HashMap::new(),
+            removed: HashSet::new(),
         }
     }
 
@@ -705,6 +740,45 @@ mod tests {
         let matches: Vec<Match> = (0..count).map(|index| (index, 0, vec![])).collect();
         app.indexer = Some(FuzzyIndex::from(matches));
         app
+    }
+
+    fn event(command: &str, endtime: i64) -> Event {
+        Event {
+            timestamp_millis: 0,
+            command: command.to_string(),
+            endtime,
+            exit_code: 0,
+            folder: String::new(),
+            machine: String::new(),
+            session: String::new(),
+        }
+    }
+
+    #[test]
+    fn forget_command_removes_all_occurrences() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = make_app("");
+        app.reader = EventReader::new(rx);
+        for (i, command) in ["ls", "secret", "pwd", "secret", "cd"].iter().enumerate() {
+            tx.send(event(command, i64::try_from(i).unwrap())).unwrap();
+        }
+        app.collect_new_events();
+        app.run_matcher();
+        app.selected_index = 1;
+        assert_eq!(app.selected_event().unwrap().command, "secret");
+
+        app.forget_command("secret".to_string(), 10);
+        let commands: Vec<&str> = app.events.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, ["ls", "pwd", "cd"]);
+        assert_eq!(app.dedup_map.get("cd"), Some(&2));
+        // selection stays on the same row
+        assert_eq!(app.selected_index, 1);
+        assert_eq!(app.selected_event().unwrap().command, "pwd");
+
+        // events still in flight from the loader are dropped too
+        tx.send(event("secret", 5)).unwrap();
+        app.collect_new_events();
+        assert_eq!(app.events.len(), 3);
     }
 
     #[test]
